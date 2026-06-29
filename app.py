@@ -36,13 +36,16 @@ import seaborn as sns
 import streamlit as st
 
 from sklearn.model_selection import cross_val_score, GroupKFold
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
 from sklearn.metrics import (
     average_precision_score, roc_auc_score, precision_recall_curve,
     precision_score, recall_score, f1_score, confusion_matrix,
 )
 
 from utils import (  # noqa: E402  (import após ajustar sys.path)
-    carregar_dados, carregar_split, obter_modelos,
+    carregar_dados, carregar_split, obter_modelos, obter_preprocessador,
     FEATURES_NUM, FEATURES_CAT, ALVO, SEED,
 )
 
@@ -52,6 +55,7 @@ MODELO_FINAL = "Regressão Logística"   # vencedor documentado no README
 METRICA = "average_precision"          # PR-AUC
 RECALL_ALVO = 0.80                     # capturar ao menos 80% das falhas
 N_AMOSTRA_KDE = 8000                   # amostra p/ os KDEs (alivia memória)
+N_AMOSTRA_CMP = 12000                  # amostra de treino p/ a comparação no app
 
 # Rótulos em inglês p/ EXIBIÇÃO (as chaves originais vêm de utils.py / dos dados).
 MODEL_DISPLAY = {
@@ -90,14 +94,48 @@ def get_modelo_final():
     return modelo
 
 
+def _modelos_leves() -> dict:
+    """Versões enxutas dos 3 modelos, só para a comparação DENTRO do app —
+    cabem na memória do plano grátis. Reaproveitam o mesmo pré-processamento
+    de utils.py. A comparação completa (RF 300 árvores) está em
+    src/02_modelagem.py."""
+    prep = obter_preprocessador
+    return {
+        "Regressão Logística": Pipeline([
+            ("prep", prep()),
+            ("clf", LogisticRegression(max_iter=1000, class_weight="balanced")),
+        ]),
+        "Random Forest": Pipeline([
+            ("prep", prep()),
+            ("clf", RandomForestClassifier(
+                n_estimators=120, max_depth=16, class_weight="balanced",
+                random_state=SEED, n_jobs=1)),
+        ]),
+        "Gradient Boosting": Pipeline([
+            ("prep", prep()),
+            ("clf", HistGradientBoostingClassifier(
+                class_weight="balanced", random_state=SEED, max_iter=150)),
+        ]),
+    }
+
+
 @st.cache_data(show_spinner=False)
 def get_comparacao_modelos() -> pd.DataFrame:
     """Validação cruzada 5-fold POR EQUIPAMENTO dos 3 modelos (PR-AUC).
-    Folds em sequência (n_jobs=1) para não estourar a memória do plano grátis."""
+    Usa uma amostra do treino e modelos enxutos, com folds em sequência
+    (n_jobs=1), para não estourar a memória do plano grátis."""
     X_train, _, y_train, _, grupos_train = get_split()
+
+    # Amostra o treino (mantém os grupos/equipamentos) p/ aliviar a memória.
+    if len(X_train) > N_AMOSTRA_CMP:
+        idx = X_train.sample(n=N_AMOSTRA_CMP, random_state=SEED).index
+        X_train = X_train.loc[idx]
+        y_train = y_train.loc[idx]
+        grupos_train = grupos_train.loc[idx]
+
     cv = GroupKFold(n_splits=5)
     linhas = []
-    for nome, modelo in obter_modelos().items():
+    for nome, modelo in _modelos_leves().items():
         scores = cross_val_score(
             modelo, X_train, y_train, groups=grupos_train,
             scoring=METRICA, cv=cv, n_jobs=1,
@@ -271,8 +309,9 @@ elif pagina == "🤖 Modeling":
         Metric: **PR-AUC** (*average precision*) — suited to imbalanced classes,
         unlike accuracy.
 
-        > The comparison trains 3 models (incl. Random Forest with 300 trees) and
-        > may take up to ~1–2 min on the first run. The result is cached.
+        > Lightweight in-app comparison (sampled data, smaller models) so it runs
+        > within the free tier's memory. The full-strength comparison (Random
+        > Forest with 300 trees) lives in `src/02_modelagem.py`. Result is cached.
         """
     )
 
