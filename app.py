@@ -8,6 +8,10 @@ Reaproveita TODA a lógica de dados e modelos de `src/utils.py` — este arquivo
 apenas constrói a interface e coloca cache nas partes pesadas para rodar bem
 no Streamlit Community Cloud (plano grátis, ~1 GB de RAM).
 
+A navegação é por barra lateral (não por abas) de propósito: assim apenas a
+seção selecionada é executada a cada recarregamento, mantendo o uso de memória
+baixo o suficiente para o plano grátis.
+
 Observação: a interface (texto visível) está em inglês; os comentários e os
 nomes de funções/variáveis seguem em português (reaproveitados de utils.py).
 
@@ -39,7 +43,7 @@ from sklearn.metrics import (
 
 from utils import (  # noqa: E402  (import após ajustar sys.path)
     carregar_dados, carregar_split, obter_modelos,
-    FEATURES_NUM, FEATURES_CAT, ALVO,
+    FEATURES_NUM, FEATURES_CAT, ALVO, SEED,
 )
 
 sns.set_theme(style="whitegrid")
@@ -47,6 +51,7 @@ sns.set_theme(style="whitegrid")
 MODELO_FINAL = "Regressão Logística"   # vencedor documentado no README
 METRICA = "average_precision"          # PR-AUC
 RECALL_ALVO = 0.80                     # capturar ao menos 80% das falhas
+N_AMOSTRA_KDE = 8000                   # amostra p/ os KDEs (alivia memória)
 
 # Rótulos em inglês p/ EXIBIÇÃO (as chaves originais vêm de utils.py / dos dados).
 MODEL_DISPLAY = {
@@ -87,14 +92,15 @@ def get_modelo_final():
 
 @st.cache_data(show_spinner=False)
 def get_comparacao_modelos() -> pd.DataFrame:
-    """Validação cruzada 5-fold POR EQUIPAMENTO dos 3 modelos (PR-AUC)."""
+    """Validação cruzada 5-fold POR EQUIPAMENTO dos 3 modelos (PR-AUC).
+    Folds em sequência (n_jobs=1) para não estourar a memória do plano grátis."""
     X_train, _, y_train, _, grupos_train = get_split()
     cv = GroupKFold(n_splits=5)
     linhas = []
     for nome, modelo in obter_modelos().items():
         scores = cross_val_score(
             modelo, X_train, y_train, groups=grupos_train,
-            scoring=METRICA, cv=cv, n_jobs=-1,
+            scoring=METRICA, cv=cv, n_jobs=1,
         )
         linhas.append({
             "Model": MODEL_DISPLAY.get(nome, nome),
@@ -148,7 +154,7 @@ def importancias(modelo) -> pd.Series | None:
 
 
 # ----------------------------------------------------------------------
-# Cabeçalho
+# Cabeçalho + navegação (barra lateral)
 # ----------------------------------------------------------------------
 st.title("⚙️ Predictive Maintenance of Critical Equipment — Offshore")
 st.caption(
@@ -158,19 +164,16 @@ st.caption(
 
 df = get_dados()
 
-aba_visao, aba_eda, aba_modelagem, aba_avaliacao, aba_previsao = st.tabs([
-    "📌 Overview",
-    "📊 EDA",
-    "🤖 Modeling",
-    "✅ Evaluation",
-    "🔮 Prediction",
-])
+PAGINAS = ["📌 Overview", "📊 EDA", "🤖 Modeling", "✅ Evaluation", "🔮 Prediction"]
+st.sidebar.header("Navigation")
+pagina = st.sidebar.radio("Section", PAGINAS, label_visibility="collapsed")
+st.sidebar.caption("Predictive maintenance — 72h failure horizon.")
 
 
 # ----------------------------------------------------------------------
-# Aba 1 — Overview
+# Overview
 # ----------------------------------------------------------------------
-with aba_visao:
+if pagina == "📌 Overview":
     st.subheader("The problem")
     st.markdown(
         """
@@ -215,9 +218,9 @@ with aba_visao:
 
 
 # ----------------------------------------------------------------------
-# Aba 2 — EDA
+# EDA
 # ----------------------------------------------------------------------
-with aba_eda:
+elif pagina == "📊 EDA":
     st.subheader("Data understanding (Phase 2 — CRISP-DM)")
 
     st.markdown("**Descriptive statistics of the sensors**")
@@ -244,10 +247,12 @@ with aba_eda:
         plt.close(fig)
 
     st.markdown("**Sensors: healthy equipment (0) vs. about to fail (1)**")
+    # Amostra para o KDE — mantém o gráfico representativo sem pesar na memória.
+    amostra = df.sample(min(len(df), N_AMOSTRA_KDE), random_state=SEED)
     principais = ["vibration_rms", "bearing_temp", "oil_temp", "oil_pressure"]
     fig, axes = plt.subplots(2, 2, figsize=(11, 7))
     for ax, feat in zip(axes.ravel(), principais):
-        sns.kdeplot(data=df, x=feat, hue=ALVO, common_norm=False,
+        sns.kdeplot(data=amostra, x=feat, hue=ALVO, common_norm=False,
                     fill=True, alpha=0.4, ax=ax)
         ax.set_title(f"{feat} by class")
     fig.tight_layout()
@@ -256,9 +261,9 @@ with aba_eda:
 
 
 # ----------------------------------------------------------------------
-# Aba 3 — Modeling
+# Modeling
 # ----------------------------------------------------------------------
-with aba_modelagem:
+elif pagina == "🤖 Modeling":
     st.subheader("Model comparison (Phases 3 and 4 — CRISP-DM)")
     st.markdown(
         """
@@ -267,7 +272,7 @@ with aba_modelagem:
         unlike accuracy.
 
         > The comparison trains 3 models (incl. Random Forest with 300 trees) and
-        > may take up to ~1 min on the first run. The result is cached.
+        > may take up to ~1–2 min on the first run. The result is cached.
         """
     )
 
@@ -305,9 +310,9 @@ with aba_modelagem:
 
 
 # ----------------------------------------------------------------------
-# Aba 4 — Evaluation
+# Evaluation
 # ----------------------------------------------------------------------
-with aba_avaliacao:
+elif pagina == "✅ Evaluation":
     st.subheader("Final evaluation on the test set (Phase 5 — CRISP-DM)")
     st.markdown(
         f"Final model: **{MODEL_DISPLAY[MODELO_FINAL]}**, evaluated on "
@@ -366,9 +371,9 @@ with aba_avaliacao:
 
 
 # ----------------------------------------------------------------------
-# Aba 5 — Prediction
+# Prediction
 # ----------------------------------------------------------------------
-with aba_previsao:
+elif pagina == "🔮 Prediction":
     st.subheader("Interactive failure prediction")
     st.markdown(
         "Adjust the sensor values and see the estimated probability of "
