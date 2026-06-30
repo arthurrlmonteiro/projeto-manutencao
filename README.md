@@ -57,9 +57,23 @@ python src/03_avaliacao.py
 ## App interativo (Streamlit)
 
 Além dos scripts, o projeto tem um **app interativo** que reúne tudo numa única
-demonstração — ideal para o vídeo: visão geral, EDA, comparação de modelos,
-avaliação e uma **previsão interativa** (ajuste os sensores e veja a
-probabilidade de falha).
+demonstração — ideal para o vídeo. A navegação fica na barra lateral:
+
+- **Overview** — problema, decisões de método e *task analysis*.
+- **EDA** — balanceamento, correlação e distribuições por classe.
+- **Modeling** — comparação de modelos (versão leve, sob demanda).
+- **Evaluation** — métricas no teste, curva precisão-recall, matriz de confusão,
+  importância das variáveis e **calibração**.
+- **Prediction** — previsão interativa com **explicação por previsão**,
+  **comunicação de incerteza** e **loop de feedback** (human-in-the-loop).
+- **Fairness** — desempenho por subgrupo (tipo de equipamento e embarcação) para
+  expor possíveis vieses.
+- **Responsible AI** — privacidade (LGPD/GDPR) e ética (fontes de viés; justiça,
+  responsabilidade e transparência).
+
+> As seções *Overview (task analysis)*, *Prediction*, *Fairness* e
+> *Responsible AI* cobrem os quatro eixos do Projeto do Curso 3 (AI Product
+> Management): análise da tarefa, UX de IA, privacidade e ética.
 
 ### Rodar localmente
 

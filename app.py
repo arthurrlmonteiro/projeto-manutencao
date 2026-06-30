@@ -39,6 +39,7 @@ from sklearn.model_selection import cross_val_score, GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
     average_precision_score, roc_auc_score, precision_recall_curve,
     precision_score, recall_score, f1_score, confusion_matrix,
@@ -179,6 +180,74 @@ def get_avaliacao():
     }
 
 
+@st.cache_data(show_spinner=False)
+def get_predicoes_teste() -> pd.DataFrame:
+    """Probabilidades do modelo final no TESTE, com tipo de equipamento e
+    embarcação — base para a análise de subgrupo (viés) e a calibração.
+    vessel_id é recuperado do df original pelo índice (carregar_split usa
+    .iloc, então o índice de X_test alinha com o df)."""
+    modelo = get_modelo_final()
+    df_full = get_dados()
+    _, X_test, _, y_test, _ = get_split()
+    y_prob = modelo.predict_proba(X_test)[:, 1]
+    return pd.DataFrame({
+        "y_true": y_test.to_numpy(),
+        "y_prob": y_prob,
+        "equipment_type": X_test["equipment_type"].to_numpy(),
+        "vessel_id": df_full.loc[X_test.index, "vessel_id"].to_numpy(),
+    })
+
+
+@st.cache_data(show_spinner=False)
+def get_calibracao(n_bins: int = 10):
+    """Reliability diagram: fração observada de falhas vs. probabilidade média
+    prevista, por faixa (estratégia por quantis devido ao desbalanceamento)."""
+    pred = get_predicoes_teste()
+    frac_pos, mean_pred = calibration_curve(
+        pred["y_true"], pred["y_prob"], n_bins=n_bins, strategy="quantile")
+    return mean_pred, frac_pos
+
+
+def _limpar_nomes(nomes) -> list:
+    """Remove os prefixos do ColumnTransformer (num__/cat__) para exibição."""
+    return [n.split("__", 1)[-1] for n in nomes]
+
+
+def explicar_previsao(modelo, entrada: pd.DataFrame) -> pd.Series:
+    """Contribuição de cada variável ao log-odds DESTA previsão (modelo linear):
+    coef_j * valor_transformado_j. Positivo empurra para 'falha'; negativo,
+    para 'normal'."""
+    prep = modelo.named_steps["prep"]
+    clf = modelo.named_steps["clf"]
+    x = prep.transform(entrada)
+    if hasattr(x, "toarray"):
+        x = x.toarray()
+    x = np.asarray(x).ravel()
+    contrib = clf.coef_[0] * x
+    return pd.Series(contrib, index=_limpar_nomes(prep.get_feature_names_out()))
+
+
+def metricas_por_subgrupo(pred: pd.DataFrame, coluna: str, limiar: float) -> pd.DataFrame:
+    """Recall/Precision/PR-AUC por subgrupo no teste (para análise de viés).
+    Métricas que exigem as duas classes ficam NaN se o subgrupo não as tiver."""
+    linhas = []
+    for valor, g in pred.groupby(coluna):
+        y = g["y_true"].to_numpy()
+        p = g["y_prob"].to_numpy()
+        yhat = (p >= limiar).astype(int)
+        n_falhas = int(y.sum())
+        tem_2_classes = 0 < n_falhas < len(g)
+        linhas.append({
+            coluna: EQUIP_DISPLAY.get(valor, valor),
+            "n": len(g),
+            "Failures": n_falhas,
+            "Recall": recall_score(y, yhat, zero_division=0) if n_falhas else np.nan,
+            "Precision": precision_score(y, yhat, zero_division=0),
+            "PR_AUC": average_precision_score(y, p) if tem_2_classes else np.nan,
+        })
+    return pd.DataFrame(linhas).sort_values("Recall").reset_index(drop=True)
+
+
 def importancias(modelo) -> pd.Series | None:
     """Extrai importâncias/coeficientes do classificador dentro do pipeline."""
     prep = modelo.named_steps["prep"]
@@ -202,7 +271,10 @@ st.caption(
 
 df = get_dados()
 
-PAGINAS = ["📌 Overview", "📊 EDA", "🤖 Modeling", "✅ Evaluation", "🔮 Prediction"]
+PAGINAS = [
+    "📌 Overview", "📊 EDA", "🤖 Modeling", "✅ Evaluation",
+    "🔮 Prediction", "⚖️ Fairness", "🛡️ Responsible AI",
+]
 st.sidebar.header("Navigation")
 pagina = st.sidebar.radio("Section", PAGINAS, label_visibility="collapsed")
 st.sidebar.caption("Predictive maintenance — 72h failure horizon.")
@@ -247,6 +319,34 @@ if pagina == "📌 Overview":
         - **Baseline first.** We compare Logistic Regression, Random Forest and
           Gradient Boosting. On the sample data, **Logistic Regression**
           generalized best to new equipment.
+        """
+    )
+
+    st.divider()
+    st.subheader("Task analysis")
+    st.markdown(
+        """
+        **User & goal.** An onshore reliability manager oversees many units
+        across a fleet and must decide **which to inspect next**, before a
+        failure causes downtime or a safety incident at sea.
+
+        **Current task flow (without ML).** Watch raw sensor dashboards →
+        eyeball thresholds per gauge → react once a reading already looks bad →
+        schedule maintenance. It is **manual, reactive, and easy to miss** weak
+        early signals spread across several sensors.
+
+        **How ML reshapes the flow.** The model fuses all sensors into a single
+        **72-hour failure risk**, turning the task from *"watch every gauge"*
+        into *"triage a ranked early-warning list."* Insights driving the design:
+
+        - **Prioritize, don't replace.** The output is a **risk score + alert**,
+          not an auto-shutdown — the manager stays the decision-maker.
+        - **Recall-first.** Missing a failure is costlier than a false alarm, so
+          the task is tuned to **catch ≥ 80% of failures** and surface them early.
+        - **Explain to earn trust.** Each alert ships with **why** (which sensors
+          drove it) and **how confident** it is, so the human can sanity-check it.
+        - **Close the loop.** The manager confirms whether an alert was right,
+          feeding monitoring and retraining (see *Prediction* and *Responsible AI*).
         """
     )
 
@@ -408,6 +508,24 @@ elif pagina == "✅ Evaluation":
         st.pyplot(fig)
         plt.close(fig)
 
+    st.divider()
+    st.markdown("**Calibration (are the probabilities trustworthy?)**")
+    st.markdown(
+        "A reliability diagram compares the **predicted** probability with the "
+        "**observed** failure frequency. Points near the diagonal mean the "
+        "probabilities can be read at face value — important when the number is "
+        "shown to a human who must act on it."
+    )
+    mean_pred, frac_pos = get_calibracao()
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot([0, 1], [0, 1], "--", color="gray", label="Perfectly calibrated")
+    ax.plot(mean_pred, frac_pos, "o-", color="steelblue", label="Model")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Observed failure frequency")
+    ax.legend()
+    st.pyplot(fig)
+    plt.close(fig)
+
 
 # ----------------------------------------------------------------------
 # Prediction
@@ -466,4 +584,203 @@ elif pagina == "🔮 Prediction":
     st.caption(
         f"The {limiar:.1%} threshold was chosen during evaluation to capture "
         f"≥ {RECALL_ALVO:.0%} of real failures."
+    )
+
+    # ---- Communicating uncertainty -----------------------------------
+    st.divider()
+    st.markdown("#### How confident is this estimate?")
+    faixa = df[FEATURES_NUM].quantile([0.05, 0.95])
+    fora = [f for f in FEATURES_NUM
+            if not faixa.loc[0.05, f] <= valores[f] <= faixa.loc[0.95, f]]
+    if fora:
+        st.warning(
+            "🟡 **Lower confidence** — these inputs are outside the typical "
+            "training range (5th–95th percentile), so the model is "
+            "extrapolating: **" + ", ".join(fora) + "**."
+        )
+    elif abs(prob - limiar) < 0.05:
+        st.info(
+            "🟠 **Borderline** — the probability sits close to the decision "
+            "threshold; a small change in the sensors could flip the alert."
+        )
+    else:
+        st.success(
+            "🟢 **Higher confidence** — all inputs fall within the typical "
+            "training range and the probability is clear of the threshold."
+        )
+    st.caption(
+        "The probability is a model **estimate**, not a guarantee. Calibration "
+        "is shown in the *Evaluation* section."
+    )
+
+    # ---- Transparency: why this prediction? --------------------------
+    st.divider()
+    st.markdown("#### Why this prediction? (per-sensor contribution)")
+    st.markdown(
+        "Because the model is **linear**, each sensor's push on the risk is "
+        "exact: bars to the **right raise** the failure risk, bars to the "
+        "**left lower** it (log-odds contribution for this specific input)."
+    )
+    contrib = explicar_previsao(modelo, entrada)
+    top = (contrib.reindex(contrib.abs().sort_values(ascending=False).index)
+           .head(8).iloc[::-1])
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    cores = ["#d62728" if v > 0 else "#2ca02c" for v in top.values]
+    ax.barh(top.index, top.values, color=cores)
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_xlabel("Contribution to failure risk (log-odds) — right ↑ risk, left ↓ risk")
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # ---- Feedback loop (human-in-the-loop) ---------------------------
+    st.divider()
+    st.markdown("#### Feedback loop")
+    st.markdown(
+        "Was this alert useful? Your answer is the **feedback loop** that keeps "
+        "the model honest over time."
+    )
+    st.session_state.setdefault("feedback", [])
+    col_ok, col_no, col_cnt = st.columns([1, 1, 2])
+    if col_ok.button("👍 Alert was correct"):
+        st.session_state["feedback"].append(("correct", round(prob, 4)))
+    if col_no.button("👎 Alert was wrong"):
+        st.session_state["feedback"].append(("wrong", round(prob, 4)))
+    col_cnt.metric("Feedback collected (this session)",
+                   len(st.session_state["feedback"]))
+    st.caption(
+        "Demo only: feedback lives in this browser session. In production it "
+        "would be logged to a database and feed **model monitoring and "
+        "retraining** — with a human always confirming the decision."
+    )
+
+
+# ----------------------------------------------------------------------
+# Fairness (bias by subgroup)
+# ----------------------------------------------------------------------
+elif pagina == "⚖️ Fairness":
+    st.subheader("Fairness — performance across subgroups")
+    st.markdown(
+        "A single overall score can hide **blind spots**. Here we recompute the "
+        "test-set metrics **per equipment type** and **per vessel**. A much "
+        "lower **recall** in any group means the model misses more failures "
+        "there — a fairness/safety risk to monitor and mitigate."
+    )
+
+    av = get_avaliacao()
+    pred = get_predicoes_teste()
+    limiar = av["limiar"]
+    st.caption(
+        f"Metrics at the global decision threshold ({limiar:.1%}). "
+        f"`NaN` = the subgroup lacks both classes in the test split."
+    )
+
+    fmt = {"Recall": "{:.1%}", "Precision": "{:.1%}", "PR_AUC": "{:.3f}"}
+
+    st.markdown("**By equipment type**")
+    tab_tipo = metricas_por_subgrupo(pred, "equipment_type", limiar)
+    col_t1, col_t2 = st.columns([1.1, 1])
+    with col_t1:
+        st.dataframe(tab_tipo.style.format(fmt, na_rep="—"), use_container_width=True)
+    with col_t2:
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        sns.barplot(data=tab_tipo, x="Recall", y="equipment_type",
+                    color="steelblue", ax=ax)
+        ax.axvline(RECALL_ALVO, color="red", ls="--",
+                   label=f"Target recall {RECALL_ALVO:.0%}")
+        ax.set_xlabel("Recall (failures caught)")
+        ax.set_ylabel("")
+        ax.legend()
+        st.pyplot(fig)
+        plt.close(fig)
+
+    st.divider()
+    st.markdown("**By vessel**")
+    tab_nav = metricas_por_subgrupo(pred, "vessel_id", limiar)
+    col_n1, col_n2 = st.columns([1.1, 1])
+    with col_n1:
+        st.dataframe(tab_nav.style.format(fmt, na_rep="—"), use_container_width=True)
+    with col_n2:
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        sns.barplot(data=tab_nav, x="Recall", y="vessel_id",
+                    color="seagreen", ax=ax)
+        ax.axvline(RECALL_ALVO, color="red", ls="--",
+                   label=f"Target recall {RECALL_ALVO:.0%}")
+        ax.set_xlabel("Recall (failures caught)")
+        ax.set_ylabel("")
+        ax.legend()
+        st.pyplot(fig)
+        plt.close(fig)
+
+    st.info(
+        "**How we act on this:** track recall per subgroup over time, raise the "
+        "alarm when any group drifts below target, and rebalance / recalibrate / "
+        "collect more data for the weakest groups before they cause a missed "
+        "failure. See *Responsible AI* for the full mitigation plan."
+    )
+
+
+# ----------------------------------------------------------------------
+# Responsible AI (privacy + ethics)
+# ----------------------------------------------------------------------
+elif pagina == "🛡️ Responsible AI":
+    st.subheader("Responsible AI — privacy & ethics")
+
+    st.markdown("### 🔒 Privacy")
+    st.markdown(
+        """
+        **What we collect.** Sensor telemetry (vibration, temperature, oil
+        pressure, RPM, load), equipment and vessel identifiers, and operating
+        hours/timestamps.
+
+        **Why it can be sensitive.** The readings describe *machines*, but they
+        become **personal data** the moment they can be linked to **who was on
+        shift** — turning the system into potential **worker monitoring**.
+        Vessel operating patterns are also **commercially confidential**.
+
+        **Applicable laws & obligations.**
+        - **LGPD (Brazil)** and **GDPR (EU operations/crew):** require a **lawful
+          basis**, **purpose limitation** (only for predicting maintenance, not
+          for evaluating workers), **data minimization**, **limited retention**,
+          and respect for **data-subject rights** (access, correction, deletion).
+        - **DPIA / transparency:** because monitoring is involved, run a **Data
+          Protection Impact Assessment** and **inform the crew** clearly.
+        - **Security:** encryption in transit/at rest, **role-based access**, and
+          audit logs of who sees what.
+
+        **Our approach.** Pseudonymize equipment/crew IDs, **decouple** sensor
+        data from individual identities by default, aggregate where possible, set
+        explicit retention windows, and keep the model's purpose strictly
+        maintenance — never silent performance scoring of people.
+        """
+    )
+
+    st.divider()
+    st.markdown("### ⚖️ Ethics — bias sources & mitigations")
+    st.markdown(
+        """
+        | Potential bias source | Why it happens | Mitigation |
+        |---|---|---|
+        | **Subgroup imbalance** | Some equipment types / vessels have more data | Monitor recall per subgroup (*Fairness* tab); rebalance & collect more data |
+        | **New-equipment gap** | A brand-new unit/vessel is under-represented | Group-aware split & validation on **unseen units**; flag low-confidence extrapolation |
+        | **Sensor drift / calibration** | Sensors age and read differently across units | Periodic recalibration, drift monitoring, retraining cadence |
+        | **Label noise** | "Failure" depends on inconsistent maintenance records | Standardize failure definitions; audit labels |
+        | **Operating-condition confounding** | Harsh routes look "always risky" | Include context features; review per-condition performance |
+        """
+    )
+
+    st.divider()
+    st.markdown("### 🎯 Ethical AI goals")
+    st.markdown(
+        """
+        - **Fairness.** Equitable **recall across equipment types and vessels**,
+          not just a good overall number — measured live in the *Fairness* tab,
+          with alerts when any group drifts below target.
+        - **Accountability.** The model **recommends, a human decides**. Every
+          alert and override is **logged and auditable**, the model is
+          **versioned with a model card**, and ownership of decisions is explicit.
+        - **Transparency.** Each prediction ships with **per-sensor explanations**,
+          global **feature importance**, a **calibration** check, an **uncertainty
+          flag** for out-of-range inputs, and clearly documented **limitations**
+          (synthetic data; prototype, not production-certified).
+        """
     )
